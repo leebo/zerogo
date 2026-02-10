@@ -184,7 +184,6 @@ log-level: info
 - **SQLite** - 数据库
 - **Pion WebRTC** - NAT穿透
 - **Water** - TAP设备管理
-- **Noise Protocol** - 加密通信
 
 ### 前端
 - **React 18** - UI框架
@@ -194,6 +193,61 @@ log-level: info
 - **Recharts** - 图表
 - **Axios** - HTTP客户端
 - **Vite** - 构建工具
+
+## 加密与安全
+
+### Noise Protocol加密方案
+
+ZeroGo **不使用WireGuard**，而是实现了基于 **Noise Protocol Framework** 的自定义加密方案：
+
+```
+Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s
+```
+
+**加密组件**：
+- **Curve25519** - ECDH密钥交换（256位）
+- **ChaCha20-Poly1305** - AEAD加密（256位密钥）
+- **BLAKE2s** - 哈希函数
+- **Noise IK模式** - 相互身份认证握手
+
+**协议特性**：
+- 🔐 **前向保密** - 每次会话使用临时密钥
+- 🛡️ **身份验证** - 基于公钥的节点认证
+- 🔒 **PSK支持** - 预共享密钥增强安全性
+- ⚡ **高效性能** - ChaCha20比AES更快，尤其在没有硬件加速的设备上
+
+### 与WireGuard的对比
+
+| 特性 | ZeroGo | WireGuard |
+|------|--------|-----------|
+| **协议框架** | Noise Protocol (完整) | Noise Protocol (简化版) |
+| **网络拓扑** | Mesh网状网络 | 点对点隧道 |
+| **控制层面** | Controller集中管理 | 去中心化，无控制器 |
+| **NAT穿透** | ✅ ICE/STUN/TURN自动穿透 | ❌ 需要手动配置端口转发 |
+| **WebRTC** | ✅ 原生支持 | ❌ 不支持 |
+| **管理界面** | ✅ 现代化Web UI | ❌ 无，仅CLI |
+| **适用场景** | 复杂网络环境、动态拓扑 | 简单点对点VPN、服务器互联 |
+| **加密算法** | ChaCha20-Poly1305 | ChaCha20-Poly1305 |
+| **密钥交换** | Curve25519 | Curve25519 |
+| **握手协议** | Noise IK (相互认证) | Noise IK (简化) |
+
+### 设计理念
+
+ZeroGo的设计更接近 **ZeroTier** 而非WireGuard：
+
+**ZeroGo = ZeroTier风格 + WebRTC技术栈**
+
+- ✅ **Mesh网络** - 节点间可直连，形成网状拓扑
+- ✅ **控制器** - 集中管理网络状态和身份认证
+- ✅ **自动发现** - 通过Controller自动发现其他节点
+- ✅ **NAT穿透** - 基于WebRTC ICE的智能穿透
+- ✅ **即插即用** - 无需复杂网络配置
+
+**WireGuard更适合**：
+- 简单的点对点连接
+- 固定IP地址的服务器互联
+- 对NAT穿透没有要求的场景
+- 需要内核级性能的场景
 
 ## 交叉编译
 
