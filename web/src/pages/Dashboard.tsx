@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { Table, Button, Card, Space, Tag, Modal, Form, Input, InputNumber, message, Popconfirm } from 'antd'
+import { Table, Button, Card, Space, Tag, Modal, Form, Input, InputNumber, Switch, message, Popconfirm } from 'antd'
 import { PlusOutlined, EditOutlined, DeleteOutlined, EyeOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import type { Network, CreateNetworkRequest } from '@/types'
@@ -15,18 +15,21 @@ const Dashboard: React.FC = () => {
   const navigate = useNavigate()
 
   const fetchNetworks = async () => {
+    console.log('Fetching networks...')
     setLoading(true)
     try {
       const data = await networkApi.list()
+      console.log('Networks data:', data)
       setNetworks(data)
     } catch (error) {
-      // Error already handled
+      console.error('Fetch networks error:', error)
     } finally {
       setLoading(false)
     }
   }
 
   useEffect(() => {
+    console.log('Dashboard mounted')
     fetchNetworks()
     // Refresh data every 10 seconds
     const interval = setInterval(fetchNetworks, 10000)
@@ -36,6 +39,17 @@ const Dashboard: React.FC = () => {
   const handleCreate = () => {
     setEditingNetwork(null)
     form.resetFields()
+
+    // Generate random private IP range (10.x.x.0/24)
+    const randomOctet2 = Math.floor(Math.random() * 256)
+    const randomOctet3 = Math.floor(Math.random() * 256)
+    const defaultIPRange = `10.${randomOctet2}.${randomOctet3}.0/24`
+
+    form.setFieldsValue({
+      ip_range: defaultIPRange,
+      mtu: 2800,
+      multicast: true,
+    })
     setModalVisible(true)
   }
 
@@ -204,10 +218,9 @@ const Dashboard: React.FC = () => {
 
           <Form.Item
             name="ip_range"
-            label="IPv4 Range"
-            rules={[{ required: true, message: 'Please input IPv4 range!' }]}
+            label="IPv4 Range (Auto-generated)"
           >
-            <Input placeholder="10.147.0.0/24" />
+            <Input placeholder="10.x.x.0/24" disabled />
           </Form.Item>
 
           <Form.Item
@@ -231,7 +244,7 @@ const Dashboard: React.FC = () => {
             valuePropName="checked"
             initialValue={true}
           >
-            <InputNumber />
+            <Switch />
           </Form.Item>
 
           <Form.Item>

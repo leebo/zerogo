@@ -1,0 +1,31 @@
+## ZeroGo Controller Configuration
+
+# API listen address
+listen: 0.0.0.0:9394
+
+# Database connection (sqlite or postgres)
+database: sqlite:///Users/bobo/work/zerogo/data/controller.db
+
+# JWT secret for API authentication (change in production!)
+jwt_secret: "change-me-in-production"
+
+# STUN server config
+stun:
+  enabled: true
+  listen: 0.0.0.0:3478
+
+# TURN relay config
+turn:
+  enabled: true
+  listen: 0.0.0.0:3478
+  realm: zerogo
+  credentials:
+    user: "auto-generated"
+
+# Default admin account (created on first run)
+admin:
+  username: admin
+  password: "change-on-first-login"
+
+# Log level: debug, info, warn, error
+log_level: info

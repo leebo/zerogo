@@ -1,5 +1,5 @@
 import axios, { AxiosInstance, AxiosError, InternalAxiosRequestConfig } from 'axios'
-import { message } from 'antd'
+import { cyberMessage } from '@/components/ui/CyberMessage'
 
 // Create axios instance
 const request: AxiosInstance = axios.create({
@@ -34,24 +34,24 @@ request.interceptors.response.use(
       const status = error.response.status
       switch (status) {
         case 401:
-          message.error('Unauthorized, please login')
+          cyberMessage.error('Unauthorized, please login')
           localStorage.removeItem('token')
           window.location.href = '/login'
           break
         case 403:
-          message.error('Forbidden')
+          cyberMessage.error('Forbidden')
           break
         case 404:
-          message.error('Resource not found')
+          cyberMessage.error('Resource not found')
           break
         case 500:
-          message.error('Server error')
+          cyberMessage.error('Server error')
           break
         default:
-          message.error((error.response.data as any)?.error || 'Request failed')
+          cyberMessage.error((error.response.data as any)?.error || 'Request failed')
       }
     } else {
-      message.error('Network error')
+      cyberMessage.error('Network error')
     }
     return Promise.reject(error)
   }
