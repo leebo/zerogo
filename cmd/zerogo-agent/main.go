@@ -23,10 +23,11 @@ func main() {
 		tapName      = flag.String("tap", "zt0", "TAP device name")
 		tapIP        = flag.String("tap-ip", "", "IP/mask to assign to TAP (e.g., 10.147.17.1/24)")
 		tapMTU       = flag.Int("mtu", 2800, "TAP device MTU")
-		networkID    = flag.Int("network", 1, "network ID")
+		networkID    = flag.Int("network", 1, "network ID (for static mode)")
+		networks     = flag.String("networks", "", "comma-separated network IDs to join via controller")
 		peers        = flag.String("peer", "", "static peer(s): pubkey@host:port,pubkey@host:port")
 		pskHex       = flag.String("psk", "", "pre-shared key (hex, 64 chars)")
-		controller   = flag.String("controller", "", "controller URL (ws://host:port)")
+		controller   = flag.String("controller", "", "controller URL (ws://host:port or http://host:port)")
 		logLevel     = flag.String("log-level", "info", "log level: debug, info, warn, error")
 		showVersion  = flag.Bool("version", false, "show version and exit")
 		showIdentity = flag.Bool("show-identity", false, "show identity and exit")
@@ -74,6 +75,21 @@ func main() {
 		PSK:           psk,
 		ControllerURL: *controller,
 		LogLevel:      *logLevel,
+	}
+
+	// Parse network IDs for controller mode
+	if *networks != "" {
+		cfg.Networks = strings.Split(*networks, ",")
+		for i := range cfg.Networks {
+			cfg.Networks[i] = strings.TrimSpace(cfg.Networks[i])
+		}
+	}
+
+	// Convert http:// to ws:// for controller URL
+	if cfg.ControllerURL != "" && strings.HasPrefix(cfg.ControllerURL, "http://") {
+		cfg.ControllerURL = "ws://" + cfg.ControllerURL[7:]
+	} else if cfg.ControllerURL != "" && strings.HasPrefix(cfg.ControllerURL, "https://") {
+		cfg.ControllerURL = "wss://" + cfg.ControllerURL[8:]
 	}
 
 	// Parse static peers

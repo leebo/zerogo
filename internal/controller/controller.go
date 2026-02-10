@@ -3,6 +3,9 @@ package controller
 import (
 	"fmt"
 	"log/slog"
+	"net/http"
+	"os"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/unicornultrafoundation/zerogo/internal/config"
@@ -49,6 +52,9 @@ func New(cfg *config.ControllerConfig, log *slog.Logger) (*Controller, error) {
 	ctrl.ws = NewWSHandler(ctrl, log)
 	ctrl.SetupRoutes(router)
 
+	// Serve static files for web UI
+	ctrl.setupStaticFiles(router)
+
 	return ctrl, nil
 }
 
@@ -89,4 +95,27 @@ func corsMiddleware() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+// setupStaticFiles configures static file serving for the web UI.
+func (ctrl *Controller) setupStaticFiles(router *gin.Engine) {
+	// Serve index.html for root and all non-API routes
+	router.NoRoute(func(c *gin.Context) {
+		// Don't handle API routes
+		if strings.HasPrefix(c.Request.URL.Path, "/api/") {
+			c.JSON(http.StatusNotFound, gin.H{"error": "API endpoint not found"})
+			return
+		}
+
+		// In production, serve from embedded filesystem or configured path
+		// For development, we expect the web UI to be served separately
+		// You can configure a static path via environment variable
+		staticPath := "/usr/local/share/zerogo/web"
+		if envPath := os.Getenv("ZEROGO_WEB_PATH"); envPath != "" {
+			staticPath = envPath
+		}
+
+		// Try to serve index.html from static path
+		c.File(staticPath + "/index.html")
+	})
 }
