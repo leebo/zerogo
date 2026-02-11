@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 )
 
 const (
@@ -139,4 +140,39 @@ func NewHandshakePacket(payload []byte) *Packet {
 		},
 		Payload: payload,
 	}
+}
+
+// --- Buffer pool for zero-allocation send/receive paths ---
+
+var packetBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, MaxPacketSize)
+		return &buf
+	},
+}
+
+// GetPacketBuf returns a *[]byte of MaxPacketSize from the pool.
+func GetPacketBuf() *[]byte { return packetBufPool.Get().(*[]byte) }
+
+// PutPacketBuf returns a buffer to the pool.
+func PutPacketBuf(b *[]byte) { packetBufPool.Put(b) }
+
+// EncodePacketTo writes header + payload into buf and returns the number of bytes written.
+// buf must be large enough to hold HeaderSize + len(payload).
+func EncodePacketTo(buf []byte, hdr *Header, payload []byte) int {
+	hdr.Encode(buf[:HeaderSize])
+	n := copy(buf[HeaderSize:], payload)
+	return HeaderSize + n
+}
+
+// DecodePacketInto parses data into an existing Packet, avoiding heap allocation.
+// The Packet's Payload will be a sub-slice of data (no copy).
+func DecodePacketInto(p *Packet, data []byte) error {
+	hdr, err := DecodeHeader(data)
+	if err != nil {
+		return err
+	}
+	p.Header = hdr
+	p.Payload = data[HeaderSize:]
+	return nil
 }

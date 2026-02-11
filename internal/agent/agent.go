@@ -173,6 +173,12 @@ func (a *Agent) Start() error {
 func (a *Agent) Stop() {
 	a.log.Info("agent stopping...")
 	a.cancel()
+	// Close all ICE connections
+	for _, peer := range a.peers.AllPeers() {
+		if peer.HasICE() {
+			peer.CloseICE()
+		}
+	}
 	if a.transport != nil {
 		a.transport.Close()
 	}
@@ -258,8 +264,8 @@ func (a *Agent) udpReadLoop() {
 
 // handleUDPPacket processes an incoming VL1 packet.
 func (a *Agent) handleUDPPacket(data []byte, from *net.UDPAddr) {
-	pkt, err := vl1.DecodePacket(data)
-	if err != nil {
+	var pkt vl1.Packet
+	if err := vl1.DecodePacketInto(&pkt, data); err != nil {
 		a.log.Debug("decode packet", "err", err, "from", from)
 		return
 	}
@@ -269,7 +275,7 @@ func (a *Agent) handleUDPPacket(data []byte, from *net.UDPAddr) {
 		a.handleHandshake(pkt.Payload, from)
 
 	case vl1.PacketTypeData:
-		a.handleDataPacket(pkt, from)
+		a.handleDataPacket(&pkt, from)
 
 	case vl1.PacketTypeKeepalive:
 		// Find peer and touch
@@ -299,7 +305,7 @@ func (a *Agent) handleHandshake(payload []byte, from *net.UDPAddr) {
 	peer := a.peers.GetPeer(remoteAddr)
 	if peer != nil {
 		// Update endpoint and touch — keys are already derived
-		peer.Endpoint = from
+		a.peers.UpdatePeerEndpoint(remoteAddr, from)
 		peer.Touch()
 
 		// If not yet connected, derive keys now
@@ -332,8 +338,10 @@ func (a *Agent) handleDataPacket(pkt *vl1.Packet, from *net.UDPAddr) {
 	}
 	peer.Touch()
 
-	// Decrypt payload
-	plaintext, err := peer.Decrypt(pkt.Payload)
+	// Decrypt payload into a pool buffer
+	bufp := vl1.GetPacketBuf()
+	defer vl1.PutPacketBuf(bufp)
+	plaintext, err := peer.DecryptTo(*bufp, pkt.Payload)
 	if err != nil {
 		a.log.Debug("decrypt failed", "peer", peer.Address, "err", err, "payload_len", len(pkt.Payload))
 		return
@@ -367,7 +375,25 @@ func (a *Agent) handleDataPacket(pkt *vl1.Packet, from *net.UDPAddr) {
 func (a *Agent) sendHello(peer *vl1.Peer) {
 	// Hello payload: our public key (32 bytes)
 	pkt := vl1.NewHandshakePacket(a.identity.PublicKey[:])
-	if err := a.transport.SendPacket(pkt, peer.Endpoint); err != nil {
+	encoded := pkt.Encode()
+
+	// Prefer ICE connection if available
+	if iceConn := peer.ICEConn(); iceConn != nil {
+		if _, err := iceConn.Write(encoded); err != nil {
+			a.log.Debug("send hello via ICE failed", "peer", peer.Address, "err", err)
+			return
+		}
+		peer.LastSend = time.Now()
+		a.log.Info("hello sent via ICE", "peer", peer.Address)
+		return
+	}
+
+	if peer.Endpoint == nil {
+		a.log.Debug("send hello skipped: no endpoint", "peer", peer.Address)
+		return
+	}
+
+	if err := a.transport.SendTo(encoded, peer.Endpoint); err != nil {
 		a.log.Debug("send hello failed", "peer", peer.Address, "err", err)
 		return
 	}
@@ -401,8 +427,15 @@ func (a *Agent) maintenanceLoop() {
 			for _, peer := range a.peers.ConnectedPeers() {
 				if peer.NeedsKeepalive() {
 					pkt := vl1.NewKeepalivePacket()
-					if err := a.transport.SendPacket(pkt, peer.Endpoint); err != nil {
-						a.log.Debug("keepalive send failed", "peer", peer.Address, "err", err)
+					encoded := pkt.Encode()
+					if iceConn := peer.ICEConn(); iceConn != nil {
+						if _, err := iceConn.Write(encoded); err != nil {
+							a.log.Debug("ICE keepalive failed", "peer", peer.Address, "err", err)
+						}
+					} else if peer.Endpoint != nil {
+						if err := a.transport.SendTo(encoded, peer.Endpoint); err != nil {
+							a.log.Debug("keepalive send failed", "peer", peer.Address, "err", err)
+						}
 					}
 					peer.LastSend = time.Now()
 				}
@@ -410,7 +443,7 @@ func (a *Agent) maintenanceLoop() {
 
 			// Re-send hello for peers that aren't connected yet
 			for _, peer := range a.peers.AllPeers() {
-				if !peer.IsConnected() {
+				if !peer.IsConnected() && !peer.HasICE() {
 					a.sendHello(peer)
 				}
 			}
@@ -429,6 +462,84 @@ func (a *Agent) maintenanceLoop() {
 	}
 }
 
+// iceReadLoop reads VL1 packets from an ICE connection for a specific peer.
+func (a *Agent) iceReadLoop(peer *vl1.Peer, conn net.Conn) {
+	defer a.wg.Done()
+	buf := make([]byte, vl1.MaxPacketSize)
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		default:
+		}
+		n, err := conn.Read(buf)
+		if err != nil {
+			if a.ctx.Err() != nil {
+				return
+			}
+			a.log.Debug("ICE read error", "peer", peer.Address, "err", err)
+			peer.CloseICE()
+			return
+		}
+		a.handleICEPacket(buf[:n], peer)
+	}
+}
+
+// handleICEPacket processes a VL1 packet received over an ICE connection.
+func (a *Agent) handleICEPacket(data []byte, peer *vl1.Peer) {
+	var pkt vl1.Packet
+	if err := vl1.DecodePacketInto(&pkt, data); err != nil {
+		a.log.Debug("ICE decode packet", "peer", peer.Address, "err", err)
+		return
+	}
+
+	peer.Touch()
+
+	switch pkt.Header.Type {
+	case vl1.PacketTypeHandshake:
+		// Hello from peer via ICE — derive keys if needed
+		if len(pkt.Payload) >= 32 && !peer.IsConnected() {
+			var remotePubKey [32]byte
+			copy(remotePubKey[:], pkt.Payload[:32])
+			sendKey, recvKey := vl1.DeriveKeysFromPSK(a.config.PSK, a.identity.PublicKey, remotePubKey)
+			cipher := vl1.NewNoiseCipher(sendKey, recvKey)
+			peer.SetCipher(cipher)
+			a.log.Info("peer connected via ICE handshake", "peer", peer.Address)
+		}
+
+	case vl1.PacketTypeData:
+		bufp := vl1.GetPacketBuf()
+		defer vl1.PutPacketBuf(bufp)
+		plaintext, err := peer.DecryptTo(*bufp, pkt.Payload)
+		if err != nil {
+			a.log.Debug("ICE decrypt failed", "peer", peer.Address, "err", err)
+			return
+		}
+
+		if a.network == nil {
+			return
+		}
+
+		frameToInject, err := a.network.Switch.HandleRemoteFrame(peer.Address, plaintext)
+		if err != nil {
+			a.log.Debug("ICE switch handle remote frame", "err", err)
+			return
+		}
+
+		if frameToInject != nil && a.tapDev != nil {
+			if _, err := a.tapDev.Write(frameToInject); err != nil {
+				a.log.Error("TAP write error from ICE", "err", err)
+			}
+		}
+
+	case vl1.PacketTypeKeepalive:
+		// Already touched above
+
+	default:
+		a.log.Debug("ICE unknown packet type", "type", pkt.Header.Type, "peer", peer.Address)
+	}
+}
+
 // --- PeerSender interface implementation ---
 
 // SendToPeer sends an encrypted Ethernet frame to a specific peer.
@@ -441,29 +552,64 @@ func (a *Agent) SendToPeer(peerAddr identity.Address, networkID uint32, frame []
 		return fmt.Errorf("peer not connected: %s", peerAddr)
 	}
 
-	encrypted, err := peer.Encrypt(frame)
+	bufp := vl1.GetPacketBuf()
+	defer vl1.PutPacketBuf(bufp)
+	buf := *bufp
+
+	// Write header into buf[0:HeaderSize]
+	hdr := vl1.Header{Version: vl1.Version, Type: vl1.PacketTypeData, NetworkID: networkID}
+	hdr.Encode(buf[:vl1.HeaderSize])
+
+	// Encrypt directly into buf[HeaderSize:]
+	n, err := peer.EncryptTo(buf[vl1.HeaderSize:], frame)
 	if err != nil {
 		return err
 	}
+	total := vl1.HeaderSize + n
 
-	pkt := vl1.NewDataPacket(networkID, encrypted)
-	return a.transport.SendPacket(pkt, peer.Endpoint)
+	// Prefer ICE connection if available
+	if iceConn := peer.ICEConn(); iceConn != nil {
+		_, err := iceConn.Write(buf[:total])
+		return err
+	}
+
+	if peer.Endpoint == nil {
+		return fmt.Errorf("peer %s: no endpoint and no ICE connection", peerAddr)
+	}
+	return a.transport.SendTo(buf[:total], peer.Endpoint)
 }
 
 // BroadcastToPeers sends an encrypted Ethernet frame to all connected peers in the network.
 func (a *Agent) BroadcastToPeers(networkID uint32, frame []byte, excludePeer identity.Address) error {
+	bufp := vl1.GetPacketBuf()
+	defer vl1.PutPacketBuf(bufp)
+	buf := *bufp
+
+	// Write header once (same for all peers)
+	hdr := vl1.Header{Version: vl1.Version, Type: vl1.PacketTypeData, NetworkID: networkID}
+	hdr.Encode(buf[:vl1.HeaderSize])
+
 	for _, peer := range a.peers.ConnectedPeers() {
 		if peer.Address == excludePeer {
 			continue
 		}
-		encrypted, err := peer.Encrypt(frame)
+
+		// Encrypt directly into buf[HeaderSize:] (each peer has different cipher)
+		n, err := peer.EncryptTo(buf[vl1.HeaderSize:], frame)
 		if err != nil {
 			a.log.Debug("encrypt for broadcast", "peer", peer.Address, "err", err)
 			continue
 		}
-		pkt := vl1.NewDataPacket(networkID, encrypted)
-		if err := a.transport.SendPacket(pkt, peer.Endpoint); err != nil {
-			a.log.Debug("broadcast send", "peer", peer.Address, "err", err)
+		total := vl1.HeaderSize + n
+
+		if iceConn := peer.ICEConn(); iceConn != nil {
+			if _, err := iceConn.Write(buf[:total]); err != nil {
+				a.log.Debug("broadcast send via ICE", "peer", peer.Address, "err", err)
+			}
+		} else if peer.Endpoint != nil {
+			if err := a.transport.SendTo(buf[:total], peer.Endpoint); err != nil {
+				a.log.Debug("broadcast send", "peer", peer.Address, "err", err)
+			}
 		}
 	}
 	return nil

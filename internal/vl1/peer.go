@@ -46,6 +46,40 @@ const (
 	HandshakeRetryInterval = 3 * time.Second
 )
 
+// ICEState represents the ICE negotiation state.
+type ICEState int
+
+const (
+	ICEStateNone       ICEState = iota // No ICE negotiation
+	ICEStateGathering                  // Gathering candidates
+	ICEStateSignaling                  // Exchanging offers/answers
+	ICEStateConnecting                 // Connectivity checks in progress
+	ICEStateConnected                  // ICE connection established
+	ICEStateFailed                     // ICE negotiation failed
+	ICEStateClosed                     // ICE connection closed
+)
+
+func (s ICEState) String() string {
+	switch s {
+	case ICEStateNone:
+		return "none"
+	case ICEStateGathering:
+		return "gathering"
+	case ICEStateSignaling:
+		return "signaling"
+	case ICEStateConnecting:
+		return "connecting"
+	case ICEStateConnected:
+		return "connected"
+	case ICEStateFailed:
+		return "failed"
+	case ICEStateClosed:
+		return "closed"
+	default:
+		return "unknown"
+	}
+}
+
 // Peer represents a remote node we communicate with.
 type Peer struct {
 	// Identity
@@ -58,6 +92,10 @@ type Peer struct {
 
 	// Encryption
 	cipher *NoiseCipher
+
+	// ICE connection
+	iceConn  net.Conn // ICE connection (set after successful ICE negotiation)
+	iceState ICEState
 
 	// Timing
 	LastSeen     time.Time
@@ -110,6 +148,26 @@ func (p *Peer) Decrypt(ciphertext []byte) ([]byte, error) {
 	return p.cipher.Decrypt(ciphertext)
 }
 
+// EncryptTo encrypts plaintext into dst for this peer (zero-allocation path).
+func (p *Peer) EncryptTo(dst, plaintext []byte) (int, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.cipher == nil {
+		return 0, fmt.Errorf("peer %s: no cipher (not connected)", p.Address)
+	}
+	return p.cipher.EncryptTo(dst, plaintext)
+}
+
+// DecryptTo decrypts ciphertext into dst for this peer (zero-allocation path).
+func (p *Peer) DecryptTo(dst, ciphertext []byte) ([]byte, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.cipher == nil {
+		return nil, fmt.Errorf("peer %s: no cipher (not connected)", p.Address)
+	}
+	return p.cipher.DecryptTo(dst, ciphertext)
+}
+
 // IsConnected returns true if the peer has an active connection.
 func (p *Peer) IsConnected() bool {
 	p.mu.RLock()
@@ -138,18 +196,68 @@ func (p *Peer) NeedsKeepalive() bool {
 	return p.State == PeerStateConnected && time.Since(p.LastSend) > KeepaliveInterval
 }
 
+// SetICEConn sets the ICE connection for this peer.
+func (p *Peer) SetICEConn(conn net.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.iceConn = conn
+	p.iceState = ICEStateConnected
+	p.log.Info("ICE connection established")
+}
+
+// ICEConn returns the ICE connection, or nil if not established.
+func (p *Peer) ICEConn() net.Conn {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.iceConn
+}
+
+// HasICE returns true if this peer has an active ICE connection.
+func (p *Peer) HasICE() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.iceConn != nil && p.iceState == ICEStateConnected
+}
+
+// SetICEState sets the ICE negotiation state.
+func (p *Peer) SetICEState(state ICEState) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.iceState = state
+}
+
+// ICEState returns the current ICE state.
+func (p *Peer) GetICEState() ICEState {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.iceState
+}
+
+// CloseICE closes the ICE connection and resets state.
+func (p *Peer) CloseICE() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.iceConn != nil {
+		p.iceConn.Close()
+		p.iceConn = nil
+	}
+	p.iceState = ICEStateClosed
+}
+
 // PeerManager manages all known peers.
 type PeerManager struct {
-	peers map[identity.Address]*Peer
-	mu    sync.RWMutex
-	log   *slog.Logger
+	peers       map[identity.Address]*Peer
+	endpointIdx map[string]*Peer // "ip:port" → Peer
+	mu          sync.RWMutex
+	log         *slog.Logger
 }
 
 // NewPeerManager creates a new peer manager.
 func NewPeerManager(log *slog.Logger) *PeerManager {
 	return &PeerManager{
-		peers: make(map[identity.Address]*Peer),
-		log:   log.With("component", "peer-manager"),
+		peers:       make(map[identity.Address]*Peer),
+		endpointIdx: make(map[string]*Peer),
+		log:         log.With("component", "peer-manager"),
 	}
 }
 
@@ -161,13 +269,21 @@ func (pm *PeerManager) AddPeer(addr identity.Address, pubKey [32]byte, endpoint 
 		// Update endpoint if changed
 		if endpoint != nil {
 			p.mu.Lock()
+			// Remove old endpoint index entry
+			if p.Endpoint != nil {
+				delete(pm.endpointIdx, p.Endpoint.String())
+			}
 			p.Endpoint = endpoint
+			pm.endpointIdx[endpoint.String()] = p
 			p.mu.Unlock()
 		}
 		return p
 	}
 	p := NewPeer(addr, pubKey, endpoint, pm.log)
 	pm.peers[addr] = p
+	if endpoint != nil {
+		pm.endpointIdx[endpoint.String()] = p
+	}
 	pm.log.Info("peer added", "addr", addr, "endpoint", endpoint)
 	return p
 }
@@ -179,26 +295,53 @@ func (pm *PeerManager) GetPeer(addr identity.Address) *Peer {
 	return pm.peers[addr]
 }
 
-// GetPeerByEndpoint finds a peer by UDP endpoint.
+// GetPeerByEndpoint finds a peer by UDP endpoint (O(1) lookup).
 func (pm *PeerManager) GetPeerByEndpoint(addr *net.UDPAddr) *Peer {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
-	for _, p := range pm.peers {
-		p.mu.RLock()
-		if p.Endpoint != nil && p.Endpoint.IP.Equal(addr.IP) && p.Endpoint.Port == addr.Port {
-			p.mu.RUnlock()
-			return p
-		}
-		p.mu.RUnlock()
+	return pm.endpointIdx[addr.String()]
+}
+
+// UpdatePeerEndpoint atomically updates a peer's endpoint and the endpoint index.
+func (pm *PeerManager) UpdatePeerEndpoint(addr identity.Address, newEndpoint *net.UDPAddr) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	p, exists := pm.peers[addr]
+	if !exists {
+		return
 	}
-	return nil
+	p.mu.Lock()
+	if p.Endpoint != nil {
+		delete(pm.endpointIdx, p.Endpoint.String())
+	}
+	p.Endpoint = newEndpoint
+	if newEndpoint != nil {
+		pm.endpointIdx[newEndpoint.String()] = p
+	}
+	p.mu.Unlock()
+}
+
+// GetPeerByNodeAddr finds a peer by its string node address (hex-encoded).
+func (pm *PeerManager) GetPeerByNodeAddr(nodeAddr string) *Peer {
+	addr, err := identity.AddressFromHex(nodeAddr)
+	if err != nil {
+		return nil
+	}
+	return pm.GetPeer(addr)
 }
 
 // RemovePeer removes a peer by address.
 func (pm *PeerManager) RemovePeer(addr identity.Address) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
-	delete(pm.peers, addr)
+	if p, exists := pm.peers[addr]; exists {
+		p.mu.RLock()
+		if p.Endpoint != nil {
+			delete(pm.endpointIdx, p.Endpoint.String())
+		}
+		p.mu.RUnlock()
+		delete(pm.peers, addr)
+	}
 	pm.log.Info("peer removed", "addr", addr)
 }
 
@@ -233,6 +376,11 @@ func (pm *PeerManager) CleanDead() int {
 	removed := 0
 	for addr, p := range pm.peers {
 		if !p.IsAlive() && p.State == PeerStateDead {
+			p.mu.RLock()
+			if p.Endpoint != nil {
+				delete(pm.endpointIdx, p.Endpoint.String())
+			}
+			p.mu.RUnlock()
 			delete(pm.peers, addr)
 			removed++
 		}

@@ -1,6 +1,7 @@
 package vl1
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -382,6 +383,8 @@ func (hs *NoiseHandshake) computeMAC(data []byte) []byte {
 type NoiseCipher struct {
 	sendKey   [chacha20poly1305.KeySize]byte
 	recvKey   [chacha20poly1305.KeySize]byte
+	sendAEAD  cipher.AEAD
+	recvAEAD  cipher.AEAD
 	sendNonce atomic.Uint64
 	recvNonce uint64
 	recvMu    sync.Mutex
@@ -389,18 +392,24 @@ type NoiseCipher struct {
 
 // NewNoiseCipher creates a cipher pair from handshake-derived keys.
 func NewNoiseCipher(sendKey, recvKey [32]byte) *NoiseCipher {
+	sAEAD, err := chacha20poly1305.New(sendKey[:])
+	if err != nil {
+		panic("chacha20poly1305.New(sendKey): " + err.Error())
+	}
+	rAEAD, err := chacha20poly1305.New(recvKey[:])
+	if err != nil {
+		panic("chacha20poly1305.New(recvKey): " + err.Error())
+	}
 	return &NoiseCipher{
-		sendKey: sendKey,
-		recvKey: recvKey,
+		sendKey:  sendKey,
+		recvKey:  recvKey,
+		sendAEAD: sAEAD,
+		recvAEAD: rAEAD,
 	}
 }
 
 // Encrypt encrypts plaintext and prepends the 8-byte nonce counter.
 func (c *NoiseCipher) Encrypt(plaintext []byte) ([]byte, error) {
-	aead, err := chacha20poly1305.New(c.sendKey[:])
-	if err != nil {
-		return nil, err
-	}
 	counter := c.sendNonce.Add(1) - 1
 	var nonce [NoiseNonceSize]byte
 	binary.LittleEndian.PutUint64(nonce[4:], counter)
@@ -408,7 +417,7 @@ func (c *NoiseCipher) Encrypt(plaintext []byte) ([]byte, error) {
 	// Output: 8-byte counter + ciphertext + tag
 	out := make([]byte, 8, 8+len(plaintext)+NoiseTagSize)
 	binary.LittleEndian.PutUint64(out, counter)
-	out = aead.Seal(out, nonce[:], plaintext, nil)
+	out = c.sendAEAD.Seal(out, nonce[:], plaintext, nil)
 	return out, nil
 }
 
@@ -417,15 +426,50 @@ func (c *NoiseCipher) Decrypt(data []byte) ([]byte, error) {
 	if len(data) < 8+NoiseTagSize {
 		return nil, errors.New("ciphertext too short")
 	}
-	aead, err := chacha20poly1305.New(c.recvKey[:])
+	counter := binary.LittleEndian.Uint64(data[:8])
+	var nonce [NoiseNonceSize]byte
+	binary.LittleEndian.PutUint64(nonce[4:], counter)
+
+	plaintext, err := c.recvAEAD.Open(nil, nonce[:], data[8:], nil)
 	if err != nil {
-		return nil, err
+		return nil, ErrDecryptFailed
+	}
+
+	// Update receive nonce (allow some reordering)
+	c.recvMu.Lock()
+	if counter >= c.recvNonce {
+		c.recvNonce = counter + 1
+	}
+	c.recvMu.Unlock()
+
+	return plaintext, nil
+}
+
+// EncryptTo encrypts plaintext into dst (which must have capacity for 8 + len(plaintext) + NoiseTagSize).
+// Returns the number of bytes written to dst.
+func (c *NoiseCipher) EncryptTo(dst, plaintext []byte) (int, error) {
+	counter := c.sendNonce.Add(1) - 1
+	var nonce [NoiseNonceSize]byte
+	binary.LittleEndian.PutUint64(nonce[4:], counter)
+
+	// Write 8-byte counter prefix
+	binary.LittleEndian.PutUint64(dst[:8], counter)
+	// Seal appends ciphertext+tag after dst[:8]
+	out := c.sendAEAD.Seal(dst[:8], nonce[:], plaintext, nil)
+	return len(out), nil
+}
+
+// DecryptTo decrypts data (8-byte counter + ciphertext + tag) into dst.
+// Returns the plaintext as a sub-slice of dst.
+func (c *NoiseCipher) DecryptTo(dst, data []byte) ([]byte, error) {
+	if len(data) < 8+NoiseTagSize {
+		return nil, errors.New("ciphertext too short")
 	}
 	counter := binary.LittleEndian.Uint64(data[:8])
 	var nonce [NoiseNonceSize]byte
 	binary.LittleEndian.PutUint64(nonce[4:], counter)
 
-	plaintext, err := aead.Open(nil, nonce[:], data[8:], nil)
+	plaintext, err := c.recvAEAD.Open(dst[:0], nonce[:], data[8:], nil)
 	if err != nil {
 		return nil, ErrDecryptFailed
 	}
