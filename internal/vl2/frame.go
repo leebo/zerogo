@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 )
 
 const (
@@ -15,6 +16,25 @@ const (
 	// MaxFrameSize is the maximum Ethernet frame size (jumbo frame).
 	MaxFrameSize = 9000
 )
+
+// FrameBufPool is a sync.Pool for frame-sized buffers (9KB) to avoid
+// hot-path allocations in tapReadLoop.
+var FrameBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, MaxFrameSize)
+		return &buf
+	},
+}
+
+// GetFrameBuf returns a pooled frame buffer.
+func GetFrameBuf() *[]byte {
+	return FrameBufPool.Get().(*[]byte)
+}
+
+// PutFrameBuf returns a frame buffer to the pool.
+func PutFrameBuf(buf *[]byte) {
+	FrameBufPool.Put(buf)
+}
 
 // Common EtherTypes
 const (

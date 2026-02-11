@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"syscall"
 )
 
 // Transport manages the UDP socket for VL1 communication.
@@ -66,6 +67,53 @@ func (t *Transport) Close() error {
 	defer t.mu.Unlock()
 	t.closed = true
 	return t.conn.Close()
+}
+
+// SetSocketBuffers sets the send and receive buffer sizes on the UDP socket.
+func (t *Transport) SetSocketBuffers(rcvBuf, sndBuf int) error {
+	rawConn, err := t.conn.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("get raw conn: %w", err)
+	}
+	var setErr error
+	err = rawConn.Control(func(fd uintptr) {
+		if rcvBuf > 0 {
+			if e := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, rcvBuf); e != nil {
+				setErr = fmt.Errorf("set SO_RCVBUF=%d: %w", rcvBuf, e)
+				return
+			}
+		}
+		if sndBuf > 0 {
+			if e := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, sndBuf); e != nil {
+				setErr = fmt.Errorf("set SO_SNDBUF=%d: %w", sndBuf, e)
+				return
+			}
+		}
+	})
+	if err != nil {
+		return err
+	}
+	return setErr
+}
+
+// SetDSCP sets the DSCP value (Differentiated Services Code Point) on the UDP socket.
+// The dscp value is shifted into the TOS byte (dscp << 2).
+func (t *Transport) SetDSCP(dscp int) error {
+	rawConn, err := t.conn.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("get raw conn: %w", err)
+	}
+	tos := dscp << 2
+	var setErr error
+	err = rawConn.Control(func(fd uintptr) {
+		if e := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TOS, tos); e != nil {
+			setErr = fmt.Errorf("set IP_TOS=%d (DSCP %d): %w", tos, dscp, e)
+		}
+	})
+	if err != nil {
+		return err
+	}
+	return setErr
 }
 
 // LocalAddr returns the local address of the UDP socket.

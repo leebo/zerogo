@@ -28,7 +28,12 @@ func main() {
 		peers        = flag.String("peer", "", "static peer(s): pubkey@host:port,pubkey@host:port")
 		pskHex       = flag.String("psk", "", "pre-shared key (hex, 64 chars)")
 		controller   = flag.String("controller", "", "controller URL (ws://host:port or http://host:port)")
+		stunServers  = flag.String("stun", "", "comma-separated STUN server URIs (e.g., stun:stun.l.google.com:19302)")
 		logLevel     = flag.String("log-level", "info", "log level: debug, info, warn, error")
+		gaming       = flag.Bool("gaming", false, "enable gaming optimization mode (large socket buffers, DSCP EF, fast keepalive)")
+		dscp         = flag.Int("dscp", 0, "DSCP marking value (0=default, 46=EF; gaming mode defaults to 46)")
+		sndBuf       = flag.Int("sndbuf", 0, "UDP send buffer size in bytes (0=OS default; gaming mode defaults to 4MB)")
+		rcvBuf       = flag.Int("rcvbuf", 0, "UDP receive buffer size in bytes (0=OS default; gaming mode defaults to 4MB)")
 		showVersion  = flag.Bool("version", false, "show version and exit")
 		showIdentity = flag.Bool("show-identity", false, "show identity and exit")
 	)
@@ -74,7 +79,39 @@ func main() {
 		NetworkID:     uint32(*networkID),
 		PSK:           psk,
 		ControllerURL: *controller,
+		Gaming:        *gaming,
+		DSCP:          *dscp,
+		SndBuf:        *sndBuf,
+		RcvBuf:        *rcvBuf,
 		LogLevel:      *logLevel,
+	}
+
+	// Gaming mode defaults
+	if cfg.Gaming {
+		if cfg.DSCP == 0 {
+			cfg.DSCP = 46 // EF (Expedited Forwarding)
+		}
+		if cfg.SndBuf == 0 {
+			cfg.SndBuf = 4 * 1024 * 1024 // 4MB
+		}
+		if cfg.RcvBuf == 0 {
+			cfg.RcvBuf = 4 * 1024 * 1024 // 4MB
+		}
+		if cfg.LogLevel == "" || cfg.LogLevel == "debug" {
+			cfg.LogLevel = "info" // suppress debug noise in gaming mode
+			level = slog.LevelInfo
+			log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+		}
+	}
+
+	// Parse STUN servers
+	if *stunServers != "" {
+		for _, s := range strings.Split(*stunServers, ",") {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				cfg.STUNServers = append(cfg.STUNServers, s)
+			}
+		}
 	}
 
 	// Parse network IDs for controller mode

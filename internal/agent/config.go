@@ -26,5 +26,14 @@ type Config struct {
 	ControllerURL string
 	Networks      []string // network IDs to join via controller
 
+	// ICE NAT traversal
+	STUNServers []string
+
+	// Gaming optimization
+	Gaming bool // Enable gaming mode (large socket buffers, DSCP EF, reduced keepalive)
+	DSCP   int  // DSCP marking value (default 0, gaming mode default 46/EF)
+	SndBuf int  // UDP send buffer size in bytes (0 = OS default)
+	RcvBuf int  // UDP receive buffer size in bytes (0 = OS default)
+
 	LogLevel string
 }

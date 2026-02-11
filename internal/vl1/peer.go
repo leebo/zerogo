@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/unicornultrafoundation/zerogo/internal/identity"
@@ -38,6 +39,9 @@ func (s PeerState) String() string {
 const (
 	// KeepaliveInterval is how often to send keepalive packets.
 	KeepaliveInterval = 15 * time.Second
+	// GamingKeepaliveInterval is a shorter keepalive for gaming/streaming scenarios
+	// where NAT mappings must be kept alive more aggressively.
+	GamingKeepaliveInterval = 5 * time.Second
 	// PeerTimeout is when a peer is considered dead.
 	PeerTimeout = 60 * time.Second
 	// HandshakeTimeout is the max time to complete a handshake.
@@ -90,18 +94,19 @@ type Peer struct {
 	State    PeerState
 	Endpoint *net.UDPAddr // Current best endpoint
 
-	// Encryption
-	cipher *NoiseCipher
+	// Encryption — cipher is stored atomically so EncryptTo can be lock-free.
+	cipher atomic.Pointer[NoiseCipher]
 
 	// ICE connection
 	iceConn  net.Conn // ICE connection (set after successful ICE negotiation)
 	iceState ICEState
 
 	// Timing
-	LastSeen     time.Time
-	LastSend     time.Time
-	LatencyMs    int64
-	HandshakeAt  time.Time
+	LastSeen          time.Time
+	LastSend          time.Time
+	LatencyMs         int64
+	HandshakeAt       time.Time
+	KeepaliveInterval time.Duration // configurable keepalive interval (0 = default)
 
 	mu  sync.RWMutex
 	log *slog.Logger
@@ -119,10 +124,10 @@ func NewPeer(addr identity.Address, pubKey [32]byte, endpoint *net.UDPAddr, log 
 }
 
 // SetCipher sets the transport cipher after handshake completes.
-func (p *Peer) SetCipher(cipher *NoiseCipher) {
+func (p *Peer) SetCipher(c *NoiseCipher) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.cipher = cipher
+	p.cipher.Store(c)
 	p.State = PeerStateConnected
 	p.LastSeen = time.Now()
 	p.log.Info("peer connected", "endpoint", p.Endpoint)
@@ -130,49 +135,46 @@ func (p *Peer) SetCipher(cipher *NoiseCipher) {
 
 // Encrypt encrypts a payload for this peer.
 func (p *Peer) Encrypt(plaintext []byte) ([]byte, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.cipher == nil {
+	c := p.cipher.Load()
+	if c == nil {
 		return nil, fmt.Errorf("peer %s: no cipher (not connected)", p.Address)
 	}
-	return p.cipher.Encrypt(plaintext)
+	return c.Encrypt(plaintext)
 }
 
 // Decrypt decrypts a payload from this peer.
 func (p *Peer) Decrypt(ciphertext []byte) ([]byte, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.cipher == nil {
+	c := p.cipher.Load()
+	if c == nil {
 		return nil, fmt.Errorf("peer %s: no cipher (not connected)", p.Address)
 	}
-	return p.cipher.Decrypt(ciphertext)
+	return c.Decrypt(ciphertext)
 }
 
-// EncryptTo encrypts plaintext into dst for this peer (zero-allocation path).
+// EncryptTo encrypts plaintext into dst for this peer (zero-allocation, lock-free path).
+// Safe because sendAEAD is immutable after construction and sendNonce uses atomic operations.
 func (p *Peer) EncryptTo(dst, plaintext []byte) (int, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.cipher == nil {
+	c := p.cipher.Load()
+	if c == nil {
 		return 0, fmt.Errorf("peer %s: no cipher (not connected)", p.Address)
 	}
-	return p.cipher.EncryptTo(dst, plaintext)
+	return c.EncryptTo(dst, plaintext)
 }
 
 // DecryptTo decrypts ciphertext into dst for this peer (zero-allocation path).
 func (p *Peer) DecryptTo(dst, ciphertext []byte) ([]byte, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.cipher == nil {
+	c := p.cipher.Load()
+	if c == nil {
 		return nil, fmt.Errorf("peer %s: no cipher (not connected)", p.Address)
 	}
-	return p.cipher.DecryptTo(dst, ciphertext)
+	return c.DecryptTo(dst, ciphertext)
 }
 
 // IsConnected returns true if the peer has an active connection.
 func (p *Peer) IsConnected() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.State == PeerStateConnected && p.cipher != nil
+	return p.State == PeerStateConnected && p.cipher.Load() != nil
 }
 
 // IsAlive returns true if the peer has been seen recently.
@@ -190,10 +192,16 @@ func (p *Peer) Touch() {
 }
 
 // NeedsKeepalive returns true if it's time to send a keepalive.
+// If recent data was sent (within the keepalive interval), the data itself
+// serves as a keepalive and no explicit keepalive packet is needed.
 func (p *Peer) NeedsKeepalive() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.State == PeerStateConnected && time.Since(p.LastSend) > KeepaliveInterval
+	interval := p.KeepaliveInterval
+	if interval == 0 {
+		interval = KeepaliveInterval
+	}
+	return p.State == PeerStateConnected && time.Since(p.LastSend) > interval
 }
 
 // SetICEConn sets the ICE connection for this peer.

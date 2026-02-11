@@ -59,6 +59,32 @@ func (a *Agent) Start() error {
 	}
 	a.transport = transport
 
+	// Apply socket buffer tuning
+	if a.config.RcvBuf > 0 || a.config.SndBuf > 0 {
+		if err := transport.SetSocketBuffers(a.config.RcvBuf, a.config.SndBuf); err != nil {
+			a.log.Warn("set socket buffers failed", "err", err)
+		} else {
+			a.log.Info("socket buffers configured", "rcvbuf", a.config.RcvBuf, "sndbuf", a.config.SndBuf)
+		}
+	}
+
+	// Apply DSCP marking
+	if a.config.DSCP > 0 {
+		if err := transport.SetDSCP(a.config.DSCP); err != nil {
+			a.log.Warn("set DSCP failed", "err", err)
+		} else {
+			a.log.Info("DSCP marking configured", "dscp", a.config.DSCP)
+		}
+	}
+
+	if a.config.Gaming {
+		a.log.Info("gaming optimization mode enabled",
+			"dscp", a.config.DSCP,
+			"sndbuf", a.config.SndBuf,
+			"rcvbuf", a.config.RcvBuf,
+		)
+	}
+
 	// Controller mode: connect to controller, TAP will be created on NetworkConfig
 	if a.config.ControllerURL != "" {
 		a.ctrlCli = NewControllerClient(a.config.ControllerURL, a, a.log)
@@ -151,6 +177,9 @@ func (a *Agent) Start() error {
 		peerAddr := identity.AddressFromPublicKey(pubKey[:])
 
 		peer := a.peers.AddPeer(peerAddr, pubKey, endpoint)
+		if a.config.Gaming {
+			peer.KeepaliveInterval = vl1.GamingKeepaliveInterval
+		}
 		a.initiateHandshake(peer)
 	}
 
@@ -231,12 +260,18 @@ func (a *Agent) tapReadLoop() {
 		}
 
 		// Forward through virtual switch
-		frameCopy := make([]byte, n)
+		frameBuf := vl2.GetFrameBuf()
+		frameCopy := (*frameBuf)[:n]
 		copy(frameCopy, buf[:n])
-		a.log.Debug("TAP frame read", "len", n, "dst", frame.DstMAC, "src", frame.SrcMAC, "type", fmt.Sprintf("0x%04x", frame.EtherType))
-		if err := a.network.Switch.HandleLocalFrame(frameCopy); err != nil {
-			a.log.Debug("switch handle local frame", "err", err)
+		if a.log.Enabled(a.ctx, slog.LevelDebug) {
+			a.log.Debug("TAP frame read", "len", n, "dst", frame.DstMAC, "src", frame.SrcMAC, "type", fmt.Sprintf("0x%04x", frame.EtherType))
 		}
+		if err := a.network.Switch.HandleLocalFrame(frameCopy); err != nil {
+			if a.log.Enabled(a.ctx, slog.LevelDebug) {
+				a.log.Debug("switch handle local frame", "err", err)
+			}
+		}
+		vl2.PutFrameBuf(frameBuf)
 	}
 }
 
@@ -320,6 +355,9 @@ func (a *Agent) handleHandshake(payload []byte, from *net.UDPAddr) {
 
 	// Unknown peer sending hello — create and connect
 	peer = a.peers.AddPeer(remoteAddr, remotePubKey, from)
+	if a.config.Gaming {
+		peer.KeepaliveInterval = vl1.GamingKeepaliveInterval
+	}
 	sendKey, recvKey := vl1.DeriveKeysFromPSK(a.config.PSK, a.identity.PublicKey, remotePubKey)
 	cipher := vl1.NewNoiseCipher(sendKey, recvKey)
 	peer.SetCipher(cipher)
@@ -347,7 +385,9 @@ func (a *Agent) handleDataPacket(pkt *vl1.Packet, from *net.UDPAddr) {
 		return
 	}
 
-	a.log.Debug("received encrypted frame", "peer", peer.Address, "frame_len", len(plaintext))
+	if a.log.Enabled(a.ctx, slog.LevelDebug) {
+		a.log.Debug("received encrypted frame", "peer", peer.Address, "frame_len", len(plaintext))
+	}
 
 	// Check if network is ready
 	if a.network == nil {
@@ -367,7 +407,9 @@ func (a *Agent) handleDataPacket(pkt *vl1.Packet, from *net.UDPAddr) {
 		if _, err := a.tapDev.Write(frameToInject); err != nil {
 			a.log.Error("TAP write error", "err", err)
 		}
-		a.log.Debug("injected frame into TAP", "len", len(frameToInject))
+		if a.log.Enabled(a.ctx, slog.LevelDebug) {
+			a.log.Debug("injected frame into TAP", "len", len(frameToInject))
+		}
 	}
 }
 
@@ -570,13 +612,16 @@ func (a *Agent) SendToPeer(peerAddr identity.Address, networkID uint32, frame []
 	// Prefer ICE connection if available
 	if iceConn := peer.ICEConn(); iceConn != nil {
 		_, err := iceConn.Write(buf[:total])
+		peer.LastSend = time.Now()
 		return err
 	}
 
 	if peer.Endpoint == nil {
 		return fmt.Errorf("peer %s: no endpoint and no ICE connection", peerAddr)
 	}
-	return a.transport.SendTo(buf[:total], peer.Endpoint)
+	err = a.transport.SendTo(buf[:total], peer.Endpoint)
+	peer.LastSend = time.Now()
+	return err
 }
 
 // BroadcastToPeers sends an encrypted Ethernet frame to all connected peers in the network.
