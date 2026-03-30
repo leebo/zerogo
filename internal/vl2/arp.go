@@ -21,6 +21,7 @@ const (
 type ARPEntry struct {
 	MAC      net.HardwareAddr
 	LastSeen time.Time
+	Pinned   bool // If true, entry never expires (e.g. our own IP→MAC)
 }
 
 // ARPProxy intercepts ARP requests and replies from cache when possible,
@@ -89,6 +90,65 @@ func (a *ARPProxy) HandleARP(frame *EthernetFrame) []byte {
 	return nil
 }
 
+// PeerFromARP extracts the sender IP and MAC from an ARP frame.
+// Returns nil if the frame is not a valid ARP or not IPv4/Ethernet.
+func (a *ARPProxy) PeerFromARP(frame *EthernetFrame) (net.IP, net.HardwareAddr) {
+	if len(frame.Payload) < ARPHeaderSize {
+		return nil, nil
+	}
+	payload := frame.Payload
+	htype := binary.BigEndian.Uint16(payload[0:2])
+	ptype := binary.BigEndian.Uint16(payload[2:4])
+	hlen := payload[4]
+	plen := payload[5]
+	if htype != 1 || ptype != 0x0800 || hlen != 6 || plen != 4 {
+		return nil, nil
+	}
+	senderMAC := net.HardwareAddr(payload[8:14])
+	senderIP := net.IP(payload[14:18])
+	return senderIP, senderMAC
+}
+
+// Lookup returns the cached MAC for an IP, or nil if not found.
+func (a *ARPProxy) Lookup(ip net.IP) net.HardwareAddr {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return nil
+	}
+	var key [4]byte
+	copy(key[:], ip4)
+	a.mu.RLock()
+	entry, found := a.cache[key]
+	a.mu.RUnlock()
+	if found && time.Since(entry.LastSeen) < ARPCacheExpiry {
+		return entry.MAC
+	}
+	return nil
+}
+
+// Learn adds or updates an ARP cache entry (public API for seeding).
+// Seeded entries are pinned and never expire.
+func (a *ARPProxy) Learn(ip net.IP, mac net.HardwareAddr) {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return
+	}
+	var key [4]byte
+	copy(key[:], ip4)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.cache) >= ARPCacheMaxSize {
+		a.evictOldest()
+	}
+	macCopy := make(net.HardwareAddr, 6)
+	copy(macCopy, mac)
+	a.cache[key] = &ARPEntry{
+		MAC:      macCopy,
+		LastSeen: time.Now(),
+		Pinned:   true,
+	}
+}
+
 // learn adds or updates an ARP cache entry.
 func (a *ARPProxy) learn(ip [4]byte, mac net.HardwareAddr) {
 	a.mu.Lock()
@@ -133,6 +193,9 @@ func (a *ARPProxy) evictOldest() {
 	var oldestTime time.Time
 	first := true
 	for k, v := range a.cache {
+		if v.Pinned {
+			continue // never evict pinned entries
+		}
 		if first || v.LastSeen.Before(oldestTime) {
 			oldestKey = k
 			oldestTime = v.LastSeen
@@ -145,13 +208,14 @@ func (a *ARPProxy) evictOldest() {
 }
 
 // CleanExpired removes expired entries from the ARP cache.
+// Pinned entries (seeded via Learn) are never expired.
 func (a *ARPProxy) CleanExpired() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	cutoff := time.Now().Add(-ARPCacheExpiry)
 	removed := 0
 	for k, v := range a.cache {
-		if v.LastSeen.Before(cutoff) {
+		if !v.Pinned && v.LastSeen.Before(cutoff) {
 			delete(a.cache, k)
 			removed++
 		}

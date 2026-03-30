@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"runtime"
+
 	"github.com/unicornultrafoundation/zerogo/internal/identity"
 	"github.com/unicornultrafoundation/zerogo/internal/tap"
 	"github.com/unicornultrafoundation/zerogo/internal/vl1"
@@ -25,6 +27,8 @@ type Agent struct {
 	tapDev    tap.Device
 	ctrlCli   *ControllerClient
 	log       *slog.Logger
+	localIPv4 [4]byte    // our assigned IPv4, used to detect TUN bounce-back
+	localNet  *net.IPNet // VPN subnet, used to distinguish bounce-back from forwarded traffic
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -58,6 +62,14 @@ func (a *Agent) Start() error {
 		return fmt.Errorf("start transport: %w", err)
 	}
 	a.transport = transport
+
+	// Protect UDP socket from VPN routing (Android)
+	if a.config.SocketProtect != nil {
+		transport.SocketProtect = a.config.SocketProtect
+		if err := transport.ProtectSocket(); err != nil {
+			a.log.Warn("protect socket failed", "err", err)
+		}
+	}
 
 	// Apply socket buffer tuning
 	if a.config.RcvBuf > 0 || a.config.SndBuf > 0 {
@@ -109,15 +121,22 @@ func (a *Agent) Start() error {
 		return nil
 	}
 
-	// Static peer mode: create TAP immediately
-	// 2. Create TAP device
-	tapDev, err := tap.NewLinuxTAP(a.config.TAPName)
+	// Static peer mode: create TAP/TUN device
+	var tapDev tap.Device
+	switch runtime.GOOS {
+	case "darwin":
+		tapDev, err = tap.NewTUN(a.config.TAPName)
+	case "android":
+		tapDev, err = tap.NewTUNFromFD(a.config.TUNFD, a.config.TAPName)
+	default:
+		tapDev, err = tap.NewTAP(a.config.TAPName)
+	}
 	if err != nil {
 		a.transport.Close()
-		return fmt.Errorf("create TAP device: %w", err)
+		return fmt.Errorf("create network device: %w", err)
 	}
 	a.tapDev = tapDev
-	a.log.Info("TAP device created", "name", tapDev.Name())
+	a.log.Info("network device created", "name", tapDev.Name(), "tun", tapDev.IsTUN())
 
 	// 3. Configure TAP: set MTU, MAC, IP
 	mtu := a.config.TAPMTU
@@ -151,6 +170,20 @@ func (a *Agent) Start() error {
 		} else {
 			if err := tapDev.AddIPAddress(ip, ipNet.Mask); err != nil {
 				a.log.Warn("add TAP IP failed", "err", err)
+			}
+
+			// Save local IPv4 and subnet for TUN bounce-back detection
+			if ip4 := ip.To4(); ip4 != nil {
+				copy(a.localIPv4[:], ip4)
+				a.localNet = ipNet
+			}
+
+			// For TUN devices (macOS), seed ARP cache with our own IP→MAC so we
+			// can respond to ARP requests from remote peers.  Without this, Linux
+			// peers will never learn our MAC and their ICMP replies will be dropped.
+			if tapDev.IsTUN() {
+				a.network.ARP.Learn(ip, mac)
+				a.log.Info("TUN ARP cache seeded", "ip", ip, "mac", mac)
 			}
 		}
 	}
@@ -202,6 +235,16 @@ func (a *Agent) Start() error {
 func (a *Agent) Stop() {
 	a.log.Info("agent stopping...")
 	a.cancel()
+
+	// Clean managed routes before closing the device
+	if a.ctrlCli != nil {
+		a.ctrlCli.cleanupRoutes()
+	}
+
+	// Close TAP/TUN first to unblock tapReadLoop
+	if a.tapDev != nil {
+		a.tapDev.Close()
+	}
 	// Close all ICE connections
 	for _, peer := range a.peers.AllPeers() {
 		if peer.HasICE() {
@@ -211,16 +254,77 @@ func (a *Agent) Stop() {
 	if a.transport != nil {
 		a.transport.Close()
 	}
-	if a.tapDev != nil {
-		a.tapDev.Close()
+
+	// Wait for goroutines with timeout
+	done := make(chan struct{})
+	go func() {
+		a.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		a.log.Info("agent stopped")
+	case <-time.After(5 * time.Second):
+		a.log.Warn("agent stop timeout, some goroutines may not have terminated")
 	}
-	a.wg.Wait()
-	a.log.Info("agent stopped")
 }
 
 // Identity returns the agent's identity.
 func (a *Agent) Identity() *identity.Identity {
 	return a.identity
+}
+
+// Peers returns the agent's peer manager.
+func (a *Agent) Peers() *vl1.PeerManager {
+	return a.peers
+}
+
+// Config returns the agent's configuration.
+func (a *Agent) Config() Config {
+	return a.config
+}
+
+// SetTUNFD replaces the underlying TUN file descriptor at runtime.
+// This is used on Android when the VPN session is rebuilt (e.g. after a
+// route change) and VpnService.Builder.establish() returns a new fd.
+// The old fd is closed automatically.
+func (a *Agent) SetTUNFD(fd int) error {
+	if a.tapDev == nil {
+		return fmt.Errorf("no TUN device to update")
+	}
+	type fdUpdater interface {
+		UpdateFD(fd int) error
+	}
+	if u, ok := a.tapDev.(fdUpdater); ok {
+		return u.UpdateFD(fd)
+	}
+	return fmt.Errorf("TUN device does not support fd replacement")
+}
+
+// injectFrame writes a frame into the local TAP/TUN device.
+// For TUN devices, ARP frames are intercepted and replied to via the switch
+// since TUN devices cannot handle Layer 2 ARP.
+func (a *Agent) injectFrame(frame []byte) {
+	if a.tapDev == nil || a.network == nil {
+		return
+	}
+
+	if a.tapDev.IsTUN() {
+		parsed, err := vl2.ParseEthernetFrame(frame)
+		if err == nil && parsed.IsARP() {
+			// Handle ARP locally: if we have the answer, send reply back through switch
+			if reply := a.network.ARP.HandleARP(parsed); reply != nil {
+				if err := a.network.Switch.HandleLocalFrame(reply); err != nil {
+					a.log.Debug("ARP reply via switch", "err", err)
+				}
+			}
+			return // Don't inject ARP into TUN
+		}
+	}
+
+	if _, err := a.tapDev.Write(frame); err != nil {
+		a.log.Error("TAP write error", "err", err)
+	}
 }
 
 // --- Goroutine loops ---
@@ -241,6 +345,9 @@ func (a *Agent) tapReadLoop() {
 				return
 			}
 			a.log.Error("TAP read error", "err", err)
+			// Brief sleep to prevent 100% CPU spin if the device returns
+			// persistent errors (e.g. misconfigured utun on macOS).
+			time.Sleep(time.Millisecond)
 			continue
 		}
 		if n < vl2.MinFrameSize {
@@ -252,10 +359,60 @@ func (a *Agent) tapReadLoop() {
 			continue
 		}
 		if frame.IsARP() {
+			// Extract peer IP→MAC from the ARP frame so we can proactively
+			// populate the kernel ARP table below.
+			peerIP, peerMAC := a.network.ARP.PeerFromARP(frame)
 			if reply := a.network.ARP.HandleARP(frame); reply != nil {
 				// Inject ARP reply directly into TAP (no need to send to network)
 				a.tapDev.Write(reply)
 				continue
+			}
+			// On Linux the kernel does not reliably learn MAC addresses from
+			// ARP replies written to the TAP fd (TUN/TAP socket behavior).
+			// Proactively populate the kernel ARP table so the kernel can send
+			// IP packets to this peer without ARPING again.
+			if peerIP != nil && peerMAC != nil {
+				_ = a.tapDev.SetPeerARP(peerIP, peerMAC)
+			}
+		}
+
+		if a.tapDev.IsTUN() {
+			// Drop kernel bounce-back packets: when we inject a remote peer's packet
+			// into TUN and the kernel routes it back through the same TUN interface.
+			// Only drop packets whose src IP is within the VPN subnet but not our own —
+			// those are true bounce-backs. Packets from outside the VPN subnet
+			// (e.g. 192.168.1.x from a LAN behind a gateway node) are legitimate
+			// forwarded traffic and must NOT be dropped.
+			// Minimum: 14 Ethernet + 20 IPv4 = 34 bytes for complete IPv4 header
+			if frame.EtherType == vl2.EtherTypeIPv4 && n >= 34 {
+				srcIP := net.IP(buf[26:30]) // IPv4 src at offset 12 in IP header + 14 Ethernet
+				var srcArr [4]byte
+				copy(srcArr[:], srcIP)
+				if a.localIPv4 != [4]byte{} && srcArr != a.localIPv4 {
+					if a.localNet != nil && a.localNet.Contains(srcIP) {
+						continue // bounce-back: src is in VPN subnet but not us
+					}
+					// src is outside VPN subnet → forwarded traffic from gateway, allow
+				}
+			}
+
+			// Resolve broadcast dst MAC to unicast using ARP cache.
+			// TUN wraps all packets as broadcast, but we should send unicast when possible
+			// to avoid flooding and duplicate replies.
+			if frame.IsBroadcast() && n >= 34 {
+				if frame.EtherType == vl2.EtherTypeIPv4 {
+					dstIP := net.IP(buf[30:34]) // IPv4 dst at offset 16 in IP header + 14 Ethernet
+					if mac := a.network.ARP.Lookup(dstIP); mac != nil {
+						copy(buf[0:6], mac) // Rewrite dst MAC to unicast
+					} else if a.ctrlCli != nil {
+						// Destination not in ARP cache — check managed routes.
+						// If the destination falls within a managed route, use
+						// the gateway peer's MAC for unicast delivery.
+						if mac := a.ctrlCli.LookupGatewayMAC(dstIP); mac != nil {
+							copy(buf[0:6], mac)
+						}
+					}
+				}
 			}
 		}
 
@@ -266,6 +423,7 @@ func (a *Agent) tapReadLoop() {
 		if a.log.Enabled(a.ctx, slog.LevelDebug) {
 			a.log.Debug("TAP frame read", "len", n, "dst", frame.DstMAC, "src", frame.SrcMAC, "type", fmt.Sprintf("0x%04x", frame.EtherType))
 		}
+		// Ensure buffer is returned even on error
 		if err := a.network.Switch.HandleLocalFrame(frameCopy); err != nil {
 			if a.log.Enabled(a.ctx, slog.LevelDebug) {
 				a.log.Debug("switch handle local frame", "err", err)
@@ -291,6 +449,7 @@ func (a *Agent) udpReadLoop() {
 				return
 			}
 			a.log.Error("UDP read error", "err", err)
+			time.Sleep(time.Millisecond)
 			continue
 		}
 		a.handleUDPPacket(buf[:n], remoteAddr)
@@ -402,11 +561,19 @@ func (a *Agent) handleDataPacket(pkt *vl1.Packet, from *net.UDPAddr) {
 		return
 	}
 
-	// Inject into TAP device
-	if frameToInject != nil && a.tapDev != nil {
-		if _, err := a.tapDev.Write(frameToInject); err != nil {
-			a.log.Error("TAP write error", "err", err)
+	// Populate kernel ARP table for this peer so the kernel can send
+	// IP packets back without ARPING. Extract IP+MAC from the Ethernet frame.
+	if len(plaintext) >= 34 {
+		srcMAC := net.HardwareAddr(plaintext[6:12])
+		srcIP := net.IP(plaintext[26:30])
+		if srcIP.To4() != nil {
+			_ = a.tapDev.SetPeerARP(srcIP, srcMAC)
 		}
+	}
+
+	// Inject into TAP/TUN device
+	if frameToInject != nil {
+		a.injectFrame(frameToInject)
 		if a.log.Enabled(a.ctx, slog.LevelDebug) {
 			a.log.Debug("injected frame into TAP", "len", len(frameToInject))
 		}
@@ -490,10 +657,44 @@ func (a *Agent) maintenanceLoop() {
 				}
 			}
 
+			// Detect and handle dead peers
+			for _, peer := range a.peers.AllPeers() {
+				if peer.IsConnected() && !peer.IsAlive() {
+					a.log.Warn("peer timed out", "peer", peer.Address,
+						"last_seen", time.Since(peer.LastSeen).Round(time.Second))
+					wasICE := peer.HasICE()
+					peer.MarkDead()
+					// If using ICE, close the connection so it can be re-established
+					if wasICE {
+						peer.CloseICE()
+					}
+				}
+			}
+
+			// Re-initiate ICE for peers that lost their connection (before CleanDead removes them)
+			if a.ctrlCli != nil && a.ctrlCli.nat != nil {
+				for _, peer := range a.peers.AllPeers() {
+					if !peer.IsConnected() && !peer.HasICE() && peer.PublicKey != [32]byte{} {
+						remoteNodeAddr := peer.Address.String()
+						if _, pending := a.ctrlCli.pendingICE.Load(remoteNodeAddr); !pending {
+							a.log.Info("re-initiating ICE for disconnected peer", "peer", remoteNodeAddr)
+							a.ctrlCli.initiateICE(peer.Address, remoteNodeAddr, a.config.PSK)
+						}
+					}
+				}
+			}
+
+			a.peers.CleanDead()
+
 			// Clean expired MAC entries
 			if a.network != nil {
 				a.network.Switch.CleanExpired()
 				a.network.ARP.CleanExpired()
+			}
+
+			// Clean stale ICE sessions
+			if a.ctrlCli != nil {
+				a.ctrlCli.CleanStaleICE()
 			}
 
 			// Send status to controller
@@ -520,9 +721,15 @@ func (a *Agent) iceReadLoop(peer *vl1.Peer, conn net.Conn) {
 				return
 			}
 			a.log.Debug("ICE read error", "peer", peer.Address, "err", err)
-			peer.CloseICE()
+			// Only close the peer's ICE if our conn is still the active one.
+			// If the peer reconnected, a new iceReadLoop is running on a new conn,
+			// and we must not close that new connection.
+			if peer.ICEConn() == conn {
+				peer.CloseICE()
+			}
 			return
 		}
+		a.log.Debug("ICE read packet", "peer", peer.Address, "len", n, "connected", peer.IsConnected())
 		a.handleICEPacket(buf[:n], peer)
 	}
 }
@@ -531,11 +738,13 @@ func (a *Agent) iceReadLoop(peer *vl1.Peer, conn net.Conn) {
 func (a *Agent) handleICEPacket(data []byte, peer *vl1.Peer) {
 	var pkt vl1.Packet
 	if err := vl1.DecodePacketInto(&pkt, data); err != nil {
-		a.log.Debug("ICE decode packet", "peer", peer.Address, "err", err)
+		a.log.Debug("ICE decode packet", "peer", peer.Address, "err", err, "raw_len", len(data))
 		return
 	}
 
 	peer.Touch()
+
+	a.log.Debug("ICE packet type", "peer", peer.Address, "type", pkt.Header.Type, "payload_len", len(pkt.Payload))
 
 	switch pkt.Header.Type {
 	case vl1.PacketTypeHandshake:
@@ -559,6 +768,7 @@ func (a *Agent) handleICEPacket(data []byte, peer *vl1.Peer) {
 		}
 
 		if a.network == nil {
+			a.log.Debug("ICE data: no network", "peer", peer.Address)
 			return
 		}
 
@@ -568,10 +778,9 @@ func (a *Agent) handleICEPacket(data []byte, peer *vl1.Peer) {
 			return
 		}
 
-		if frameToInject != nil && a.tapDev != nil {
-			if _, err := a.tapDev.Write(frameToInject); err != nil {
-				a.log.Error("TAP write error from ICE", "err", err)
-			}
+		if frameToInject != nil {
+			a.log.Debug("ICE injecting frame into TAP", "peer", peer.Address, "len", len(frameToInject))
+			a.injectFrame(frameToInject)
 		}
 
 	case vl1.PacketTypeKeepalive:
@@ -613,6 +822,7 @@ func (a *Agent) SendToPeer(peerAddr identity.Address, networkID uint32, frame []
 	if iceConn := peer.ICEConn(); iceConn != nil {
 		_, err := iceConn.Write(buf[:total])
 		peer.LastSend = time.Now()
+		a.log.Debug("sent data via ICE", "peer", peerAddr, "frame_len", len(frame), "total", total)
 		return err
 	}
 
